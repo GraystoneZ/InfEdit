@@ -594,5 +594,5 @@ with gr.Blocks(css=css) as demo:
           cross_replace_steps, self_replace_steps, 
           thresh_e, thresh_m, denoise],
         image_out, inference, examples_per_page=20)
-demo.launch(debug=False, share=False)
+demo.launch(debug=False, share=True)
 
