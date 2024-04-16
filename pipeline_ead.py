@@ -685,6 +685,20 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                     if callback is not None and i % callback_steps == 0:
                         alpha_prod_t = self.scheduler.alphas_cumprod[t]
                         mutual_latents, latents = callback(i, t, source_latents, latents, mutual_latents, alpha_prod_t)
+                
+                # Save progress to visualize latents each step
+                vis_latents = torch.cat([source_latents, mutual_latents, latents, pred_x0], dim=0)
+                if not output_type == "latent":
+                    vis_image = self.vae.decode(vis_latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                else:
+                    vis_image = vis_latents
+
+                do_denormalize = [True] * vis_image.shape[0]
+
+                vis_image = self.image_processor.postprocess(vis_image, output_type=output_type, do_denormalize=do_denormalize)
+                image_grid = merge_images(vis_image, 1, 4)
+                image_grid.save(f'progress/{i}_{t}.png')
+
 
         # 9. Post-processing
         if not output_type == "latent":
@@ -705,3 +719,21 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             return (image, has_nsfw_concept)
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+
+
+def merge_images(image_array, rows, cols):
+    # Calculate the size of the output image
+    total_width = image_array[0].width * cols
+    total_height = image_array[0].height * rows
+
+    # Create a new blank image with the calculated size
+    merged_image = PIL.Image.new('RGB', (total_width, total_height))
+
+    # Paste each image into the appropriate position in the blank image
+    for r in range(rows):
+        for c in range(cols):
+            index = r * cols + c
+            if index < len(image_array):
+                merged_image.paste(image_array[index], (c * image_array[0].width, r * image_array[0].height))
+
+    return merged_image
