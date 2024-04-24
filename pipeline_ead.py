@@ -19,6 +19,10 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 
+from losses import init_structure_loss
+from torch.optim.adam import Adam
+from torch.optim.sgd import SGD
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -47,7 +51,8 @@ def preprocess(image):
     return image
 
 
-def ddcm_sampler(scheduler, x_s, x_t, timestep, e_s, e_t, x_0, noise, eta, to_next=True):
+def ddcm_sampler(scheduler, x_s, x_t, timestep, e_s, e_t, x_0, noise, eta, to_next=True,
+                 structure_loss_fn=None, source_image=None, vae=None, structure_loss_steps=0.5, structure_loss_weight=100.0, structure_loss_iter=100):
     if scheduler.num_inference_steps is None:
         raise ValueError(
             "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
@@ -74,9 +79,24 @@ def ddcm_sampler(scheduler, x_s, x_t, timestep, e_s, e_t, x_0, noise, eta, to_ne
 
     e_c = (x_s - alpha_prod_t ** (0.5) * x_0) / (1 - alpha_prod_t) ** (0.5)
 
-    pred_x0 = x_0 + ((x_t - x_s) - beta_prod_t ** (0.5) * (e_t - e_s)) / alpha_prod_t ** (0.5)
+    pred_x0 = x_0 + ((x_t - x_s) - beta_prod_t ** (0.5) * (e_t - e_s)) / alpha_prod_t ** (0.5)  # Same with DDS update formula!
     eps = (e_t - e_s) + e_c
-    dir_xt = (beta_prod_t_prev - std_dev_t) ** (0.5) * eps
+    dir_xt = (beta_prod_t_prev - std_dev_t) ** (0.5) * eps      # Goes 0 because of alpha and sigma setting
+
+    # Structure loss part
+    if structure_loss_fn != None and structure_loss_steps <= (scheduler.step_index*1.0 / len(scheduler.timesteps)):
+        pred_x0_gd = pred_x0.clone()
+        pred_x0_gd.requires_grad = True
+        optimizer = SGD(params=[pred_x0_gd], lr=1e-1, momentum=0.9)
+        # optimizer = Adam(params=[pred_x0_gd], lr=1e-3, eps=1e-8, fused=True)
+
+        for _ in range(structure_loss_iter):
+            optimizer.zero_grad()
+            pred_x0_gd_decode = vae.decode(pred_x0_gd / vae.config.scaling_factor, return_dict=False)[0].clamp(-1.0, 1.0)
+            loss = structure_loss_weight * structure_loss_fn(source_image, pred_x0_gd_decode)
+            loss.backward()
+            optimizer.step()
+        pred_x0 = pred_x0_gd.clone().detach()
 
     # Noise is not used for one-step sampling.
     if len(scheduler.timesteps) > 1:
@@ -489,7 +509,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
         return latents, clean_latents
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def __call__(
         self,
         prompt: Union[str, List[str]],
@@ -512,155 +532,170 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         denoise_model: Optional[bool] = True,
+        structure_loss: Optional[str] = None,
+        structure_loss_steps: Optional[float] = 0.5,
+        structure_loss_weight: Optional[float] = 1000,
+        structure_loss_iter: Optional[int] = 10
     ):
-        # 1. Check inputs
-        self.check_inputs(prompt, strength, callback_steps)
+        with torch.no_grad():
+            # print(self.unet)
+            # 1. Check inputs
+            self.check_inputs(prompt, strength, callback_steps)
 
-        # 2. Define call parameters
-        batch_size = 1 if isinstance(prompt, str) else len(prompt)
-        device = self._execution_device
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = guidance_scale > 1.0
+            # 2. Define call parameters
+            batch_size = 1 if isinstance(prompt, str) else len(prompt)
+            device = self._execution_device
+            # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+            # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+            # corresponds to doing no classifier free guidance.
+            do_classifier_free_guidance = guidance_scale > 1.0
 
-        # 3. Encode input prompt
-        text_encoder_lora_scale = (
-            cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
-        )
-        prompt_embeds_tuple = self.encode_prompt(
-            prompt,
-            device,
-            num_images_per_prompt,
-            do_classifier_free_guidance,
-            negative_prompt=negative_prompt,
-            prompt_embeds=prompt_embeds,
-            lora_scale=text_encoder_lora_scale,
-        )
-        source_prompt_embeds_tuple = self.encode_prompt(
-            source_prompt, device, num_images_per_prompt, do_classifier_free_guidance, positive_prompt, None
-        )
-        if prompt_embeds_tuple[1] is not None:
-            prompt_embeds = torch.cat([prompt_embeds_tuple[1], prompt_embeds_tuple[0]])
-        else:
-            prompt_embeds = prompt_embeds_tuple[0]
-        if source_prompt_embeds_tuple[1] is not None:
-            source_prompt_embeds = torch.cat([source_prompt_embeds_tuple[1], source_prompt_embeds_tuple[0]])
-        else:
-            source_prompt_embeds = source_prompt_embeds_tuple[0]
+            # 3. Encode input prompt
+            text_encoder_lora_scale = (
+                cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
+            )
+            prompt_embeds_tuple = self.encode_prompt(
+                prompt,
+                device,
+                num_images_per_prompt,
+                do_classifier_free_guidance,
+                negative_prompt=negative_prompt,
+                prompt_embeds=prompt_embeds,
+                lora_scale=text_encoder_lora_scale,
+            )
+            source_prompt_embeds_tuple = self.encode_prompt(
+                source_prompt, device, num_images_per_prompt, do_classifier_free_guidance, positive_prompt, None
+            )
+            if prompt_embeds_tuple[1] is not None:
+                prompt_embeds = torch.cat([prompt_embeds_tuple[1], prompt_embeds_tuple[0]])
+            else:
+                prompt_embeds = prompt_embeds_tuple[0]
+            if source_prompt_embeds_tuple[1] is not None:
+                source_prompt_embeds = torch.cat([source_prompt_embeds_tuple[1], source_prompt_embeds_tuple[0]])
+            else:
+                source_prompt_embeds = source_prompt_embeds_tuple[0]
 
-        # 4. Preprocess image
-        image = self.image_processor.preprocess(image)
+            # 4. Preprocess image
+            image = self.image_processor.preprocess(image)
 
-        # 5. Prepare timesteps
-        self.scheduler.set_timesteps(
-          num_inference_steps=num_inference_steps, 
-          device=device, 
-          original_inference_steps=original_inference_steps)
-        timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
-        latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+            # 5. Prepare timesteps
+            self.scheduler.set_timesteps(
+            num_inference_steps=num_inference_steps, 
+            device=device, 
+            original_inference_steps=original_inference_steps)
+            timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+            latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
 
-        # 6. Prepare latent variables
-        latents, clean_latents = self.prepare_latents(
-            image, latent_timestep, batch_size, num_images_per_prompt, prompt_embeds.dtype, device, denoise_model, generator
-        )
-        source_latents = latents
-        mutual_latents = latents
+            # 6. Prepare latent variables
+            latents, clean_latents = self.prepare_latents(
+                image, latent_timestep, batch_size, num_images_per_prompt, prompt_embeds.dtype, device, denoise_model, generator
+            )
+            source_latents = latents
+            mutual_latents = latents
 
-        # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
-        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-        generator = extra_step_kwargs.pop("generator", None)
+            image_vae = None
+            if structure_loss is not None:
+                # Store image that passed vae once for structure loss
+                image_vae = self.vae.decode(clean_latents / self.vae.config.scaling_factor, return_dict=False)[0].clamp(-1.0, 1.0)
 
-        # 8. Denoising loop
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+            # Initialize structure loss
+            structure_loss_fn = init_structure_loss(structure_loss)
+
+            # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+            extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+            generator = extra_step_kwargs.pop("generator", None)
+
+            # 8. Denoising loop
+            num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                source_latent_model_input = (
-                    torch.cat([source_latents] * 2) if do_classifier_free_guidance else source_latents
-                )
-                mutual_latent_model_input = (
-                    torch.cat([mutual_latents] * 2) if do_classifier_free_guidance else mutual_latents
-                )
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                source_latent_model_input = self.scheduler.scale_model_input(source_latent_model_input, t)
-                mutual_latent_model_input = self.scheduler.scale_model_input(mutual_latent_model_input, t)
-
-                # predict the noise residual
-                if do_classifier_free_guidance:
-                    concat_latent_model_input = torch.stack(
-                        [
-                            source_latent_model_input[0],
-                            latent_model_input[0],
-                            mutual_latent_model_input[0],
-                            source_latent_model_input[1],
-                            latent_model_input[1],
-                            mutual_latent_model_input[1],
-                        ],
-                        dim=0,
+                with torch.no_grad():
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                    source_latent_model_input = (
+                        torch.cat([source_latents] * 2) if do_classifier_free_guidance else source_latents
                     )
-                    concat_prompt_embeds = torch.stack(
-                        [
-                            source_prompt_embeds[0],
-                            prompt_embeds[0],
-                            source_prompt_embeds[0],
-                            source_prompt_embeds[1],
-                            prompt_embeds[1],
-                            source_prompt_embeds[1],
-                        ],
-                        dim=0,
+                    mutual_latent_model_input = (
+                        torch.cat([mutual_latents] * 2) if do_classifier_free_guidance else mutual_latents
                     )
-                else:
-                    concat_latent_model_input = torch.cat(
-                        [
-                            source_latent_model_input,
-                            latent_model_input,
-                            mutual_latent_model_input,
-                        ],
-                        dim=0,
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    source_latent_model_input = self.scheduler.scale_model_input(source_latent_model_input, t)
+                    mutual_latent_model_input = self.scheduler.scale_model_input(mutual_latent_model_input, t)
+
+                    # predict the noise residual
+                    if do_classifier_free_guidance:
+                        concat_latent_model_input = torch.stack(
+                            [
+                                source_latent_model_input[0],
+                                latent_model_input[0],
+                                mutual_latent_model_input[0],
+                                source_latent_model_input[1],
+                                latent_model_input[1],
+                                mutual_latent_model_input[1],
+                            ],
+                            dim=0,
+                        )
+                        concat_prompt_embeds = torch.stack(
+                            [
+                                source_prompt_embeds[0],
+                                prompt_embeds[0],
+                                source_prompt_embeds[0],
+                                source_prompt_embeds[1],
+                                prompt_embeds[1],
+                                source_prompt_embeds[1],
+                            ],
+                            dim=0,
+                        )
+                    else:
+                        concat_latent_model_input = torch.cat(
+                            [
+                                source_latent_model_input,
+                                latent_model_input,
+                                mutual_latent_model_input,
+                            ],
+                            dim=0,
+                        )
+                        concat_prompt_embeds = torch.cat(
+                            [
+                                source_prompt_embeds,
+                                prompt_embeds,
+                                source_prompt_embeds,
+                            ],
+                            dim=0,
+                        )
+
+                    concat_noise_pred = self.unet(
+                        concat_latent_model_input,
+                        t,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        encoder_hidden_states=concat_prompt_embeds,
+                    ).sample
+
+                    # perform guidance
+                    if do_classifier_free_guidance:
+                        (
+                            source_noise_pred_uncond,
+                            noise_pred_uncond,
+                            mutual_noise_pred_uncond,
+                            source_noise_pred_text,
+                            noise_pred_text,
+                            mutual_noise_pred_text
+                        ) = concat_noise_pred.chunk(6, dim=0)
+
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        source_noise_pred = source_noise_pred_uncond + source_guidance_scale * (
+                            source_noise_pred_text - source_noise_pred_uncond
+                        )
+                        mutual_noise_pred = mutual_noise_pred_uncond + source_guidance_scale * (
+                            mutual_noise_pred_text - mutual_noise_pred_uncond
+                        )
+
+                    else:
+                        (source_noise_pred, noise_pred, mutual_noise_pred) = concat_noise_pred.chunk(3, dim=0)
+
+                    noise = torch.randn(
+                        latents.shape, dtype=latents.dtype, device=latents.device, generator=generator
                     )
-                    concat_prompt_embeds = torch.cat(
-                        [
-                            source_prompt_embeds,
-                            prompt_embeds,
-                            source_prompt_embeds,
-                        ],
-                        dim=0,
-                    )
-
-                concat_noise_pred = self.unet(
-                    concat_latent_model_input,
-                    t,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                    encoder_hidden_states=concat_prompt_embeds,
-                ).sample
-
-                # perform guidance
-                if do_classifier_free_guidance:
-                    (
-                        source_noise_pred_uncond,
-                        noise_pred_uncond,
-                        mutual_noise_pred_uncond,
-                        source_noise_pred_text,
-                        noise_pred_text,
-                        mutual_noise_pred_text
-                    ) = concat_noise_pred.chunk(6, dim=0)
-
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                    source_noise_pred = source_noise_pred_uncond + source_guidance_scale * (
-                        source_noise_pred_text - source_noise_pred_uncond
-                    )
-                    mutual_noise_pred = mutual_noise_pred_uncond + source_guidance_scale * (
-                        mutual_noise_pred_text - mutual_noise_pred_uncond
-                    )
-
-                else:
-                    (source_noise_pred, noise_pred, mutual_noise_pred) = concat_noise_pred.chunk(3, dim=0)
-
-                noise = torch.randn(
-                    latents.shape, dtype=latents.dtype, device=latents.device, generator=generator
-                )
 
                 _, latents, pred_x0 = ddcm_sampler(
                   self.scheduler, source_latents, 
@@ -668,57 +703,69 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                   source_noise_pred, noise_pred, 
                   clean_latents, noise=noise, 
                   eta=eta, to_next=False, 
+                  structure_loss_fn=structure_loss_fn,
+                  source_image=image_vae,
+                  vae=self.vae,
+                  structure_loss_steps=structure_loss_steps,
+                  structure_loss_weight=structure_loss_weight,
+                  structure_loss_iter=structure_loss_iter,
                   **extra_step_kwargs
                 )
                 
-                source_latents, mutual_latents, pred_xm = ddcm_sampler(
-                  self.scheduler, source_latents, 
-                  mutual_latents, t, 
-                  source_noise_pred, mutual_noise_pred, 
-                  clean_latents, noise=noise, 
-                  eta=eta, **extra_step_kwargs
-                )
+                with torch.no_grad():
+                    source_latents, mutual_latents, pred_xm = ddcm_sampler(
+                    self.scheduler, source_latents, 
+                    mutual_latents, t, 
+                    source_noise_pred, mutual_noise_pred, 
+                    clean_latents, noise=noise, 
+                    eta=eta, **extra_step_kwargs
+                    )
 
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        alpha_prod_t = self.scheduler.alphas_cumprod[t]
-                        mutual_latents, latents = callback(i, t, source_latents, latents, mutual_latents, alpha_prod_t)
-                
-                # Save progress to visualize latents each step
-                vis_latents = torch.cat([source_latents, mutual_latents, latents, pred_x0], dim=0)
-                if not output_type == "latent":
-                    vis_image = self.vae.decode(vis_latents / self.vae.config.scaling_factor, return_dict=False)[0]
-                else:
-                    vis_image = vis_latents
+                    # call the callback, if provided
+                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
+                        if callback is not None and i % callback_steps == 0:
+                            alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                            mutual_latents, latents = callback(i, t, source_latents, latents, mutual_latents, alpha_prod_t)
+                    
+                    # Save progress to visualize latents each step
+                    vis_latents = torch.cat([source_latents, mutual_latents, latents, pred_x0], dim=0)
+                    if not output_type == "latent":
+                        vis_image = self.vae.decode(vis_latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                    else:
+                        vis_image = vis_latents
 
-                do_denormalize = [True] * vis_image.shape[0]
+                    do_denormalize = [True] * vis_image.shape[0]
 
-                vis_image = self.image_processor.postprocess(vis_image, output_type=output_type, do_denormalize=do_denormalize)
-                image_grid = merge_images(vis_image, 1, 4)
-                image_grid.save(f'progress/{i}_{t}.png')
+                    vis_image = self.image_processor.postprocess(vis_image, output_type=output_type, do_denormalize=do_denormalize)
+                    image_grid = merge_images(vis_image, 1, 4)
+                    image_grid.save(f'progress/{i}_{t}.png')
 
 
-        # 9. Post-processing
-        if not output_type == "latent":
-            image = self.vae.decode(pred_x0 / self.vae.config.scaling_factor, return_dict=False)[0]
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
-        else:
-            image = pred_x0
-            has_nsfw_concept = None
+        with torch.no_grad():
+            # 9. Post-processing
+            if not output_type == "latent":
+                image = self.vae.decode(pred_x0 / self.vae.config.scaling_factor, return_dict=False)[0]
+                # image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+            else:
+                image = pred_x0
+                # has_nsfw_concept = None
 
-        if has_nsfw_concept is None:
+            # if has_nsfw_concept is None:
+            #     do_denormalize = [True] * image.shape[0]
+            # else:
+            #     do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
             do_denormalize = [True] * image.shape[0]
-        else:
-            do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
-        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+            image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
         if not return_dict:
-            return (image, has_nsfw_concept)
+            # return (image, has_nsfw_concept)
+            return (image)
 
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        # return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        # return StableDiffusionPipelineOutput(images=image)
+        return image
 
 
 def merge_images(image_array, rows, cols):

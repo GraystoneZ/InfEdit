@@ -332,10 +332,13 @@ def ssim_structure(X,
     # breakpoint()
 
     if torch.any(sigma2_sq < 0).item():
-        print(f'Negative in sigma2_sq : {sigma2_sq[sigma2_sq < 0]}')
+        # print(f'Negative in sigma2_sq : {sigma2_sq[sigma2_sq < 0]}')
+        print(f'Negative numbers in sigma2_sq : {torch.sum(sigma2_sq < 0)}')
 
     sigma1 = (F.relu(sigma1_sq) + eps).sqrt()
     sigma2 = (F.relu(sigma2_sq) + eps).sqrt()
+    # sigma1 = (sigma1_sq + 65).sqrt()
+    # sigma2 = (sigma2_sq + 65).sqrt()
 
     cs_map = (2 * sigma12 + C2) / (sigma1_sq + sigma2_sq + C2) # NOT USED in SSIM_structure
     # cs_map = F.relu(cs_map)  # force the ssim response to be nonnegative to avoid negative results.

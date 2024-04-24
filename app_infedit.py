@@ -22,6 +22,7 @@ Colab Instuction"""
 
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 model_id_or_path = "SimianLuo/LCM_Dreamshaper_v7"
+# model_id_or_path = "stabilityai/stable-diffusion-2-1"
 device_print = "GPU 🔥" if torch.cuda.is_available() else "CPU 🥶"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -221,15 +222,16 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         return out
     
     def self_attn_forward(self, q, k, v, num_heads):
+        # batch dimension : [source * num_heads , target * num_heads, mutual * num_heads]
         if q.shape[0]//num_heads == 3:
-            if (self.self_replace_steps <= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
-                q=torch.cat([q[:num_heads*2],q[num_heads:num_heads*2]])
-                k=torch.cat([k[:num_heads*2],k[:num_heads]])
-                v=torch.cat([v[:num_heads*2],v[:num_heads]])
-            else:
-                q=torch.cat([q[:num_heads],q[:num_heads],q[:num_heads]])
-                k=torch.cat([k[:num_heads],k[:num_heads],k[:num_heads]])
-                v=torch.cat([v[:num_heads*2],v[:num_heads]])
+            if (self.self_replace_steps <= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ): # Later step
+                q=torch.cat([q[:num_heads*2],q[num_heads:num_heads*2]])     # [source, target, target]
+                k=torch.cat([k[:num_heads*2],k[:num_heads]])                # [source, target, source]
+                v=torch.cat([v[:num_heads*2],v[:num_heads]])                # [source, target, source]
+            else:                                                                                       # Early step
+                q=torch.cat([q[:num_heads],q[:num_heads],q[:num_heads]])    # [source, source, source]
+                k=torch.cat([k[:num_heads],k[:num_heads],k[:num_heads]])    # [source, source, source]
+                v=torch.cat([v[:num_heads*2],v[:num_heads]])                # [source, target, source]
             return q,k,v
         else:
             qu, qc = q.chunk(2)
@@ -256,9 +258,11 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         if is_cross :
             h = attn.shape[0] // self.batch_size
             attn = attn.reshape(self.batch_size,h,  *attn.shape[1:])
-            attn_base, attn_repalce,attn_masa = attn[0], attn[1], attn[2]
+            attn_base, attn_repalce,attn_masa = attn[0], attn[1], attn[2]   # source, target, mutual
             attn_replace_new = self.replace_cross_attention(attn_masa, attn_repalce) 
             attn_base_store = self.replace_cross_attention(attn_base, attn_repalce)
+            # if not torch.all(torch.eq(attn_base, attn_base_store)):
+            #     print('attn_base != attn_base_store')
             if (self.cross_replace_steps >= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
                 attn[1] = attn_base_store
             attn_store=torch.cat([attn_base_store,attn_replace_new])
@@ -303,6 +307,15 @@ class AttentionRefine(AttentionControlEdit):
                  local_blend: Optional[LocalBlend] = None):
         super(AttentionRefine, self).__init__(prompts, num_steps,start_steps, cross_replace_steps, self_replace_steps, local_blend)
         self.mapper, alphas, ms, alpha_e, alpha_m = seq_aligner.get_refinement_mapper(prompts, prompt_specifiers, tokenizer, encoder, device)
+        
+        # if not torch.all(alphas):
+        #     print(f'alphas {alphas}')
+        
+        # if torch.any(alpha_e):
+        #     print(f'alpha_e {alpha_e}')
+        
+        # if torch.any(alpha_m):
+        #     print(f'alpha_m {alpha_m}')
         self.mapper, alphas, ms = self.mapper.to(device), alphas.to(device).to(torch_dtype), ms.to(device).to(torch_dtype)
         self.alphas = alphas.reshape(alphas.shape[0], 1, 1, alphas.shape[1])
         self.ms = ms.reshape(ms.shape[0], 1, 1, ms.shape[1])
@@ -331,7 +344,10 @@ def inference(img, source_prompt, target_prompt,
           num_inference_steps,
           width, height, seed, strength,          
           cross_replace_steps, self_replace_steps, 
-          thresh_e, thresh_m, denoise, user_instruct="", api_key=""):
+          thresh_e, thresh_m, denoise,
+          structure_loss=None, structure_loss_steps=0.5,
+          structure_loss_weight=1000, structure_loss_iter=10,
+          user_instruct="", api_key=""):
     print(img)
     if user_instruct != "" and api_key != "":
         source_prompt, target_prompt, local, mutual, replace_steps, num_inference_steps = get_params(api_key, user_instruct)
@@ -367,10 +383,15 @@ def inference(img, source_prompt, target_prompt,
                    guidance_scale=guidance_t,
                    source_guidance_scale=guidance_s,
                    denoise_model=denoise,
-                   callback = controller.step_callback
+                   callback = controller.step_callback,
+                   structure_loss=structure_loss,
+                   structure_loss_steps=structure_loss_steps,
+                   structure_loss_weight=structure_loss_weight,
+                   structure_loss_iter=structure_loss_iter
                    )
 
-    return replace_nsfw_images(results)
+    # return replace_nsfw_images(results)
+    return results[0]
 
 
 def replace_nsfw_images(results):
@@ -513,11 +534,17 @@ with gr.Blocks(css=css) as demo:
                         thresh_m = gr.Slider(label="Source blend thresh", value=0.6, minimum=0, maximum=1)
                     with gr.Row():
                         cross_replace_steps = gr.Slider(label="Cross attn control schedule", value=0.7, minimum=0.0, maximum=1, step=0.01)
-                        self_replace_steps = gr.Slider(label="Self attn control schedule", value=0.3, minimum=0.0, maximum=1, step=0.01)
+                        self_replace_steps = gr.Slider(label="Self attn control schedule", value=0.5, minimum=0.0, maximum=1, step=0.01)
                     with gr.Row():
                         denoise = gr.Checkbox(label='Denoising Mode', value=False)
                         strength = gr.Slider(label="Strength", value=0.7, minimum=0, maximum=1, step=0.01, visible=False)
                         denoise.change(fn=lambda value: gr.update(visible=value), inputs=denoise, outputs=strength)
+                    with gr.Row():
+                        structure_loss = gr.Dropdown(["L1", "LPIPS", "SSIM", "SSIM_structure", None], value=None, label="Structure loss")
+                        structure_loss_steps = gr.Slider(label="Structure loss schedule", value=0.5, minimum=0.0, maximum=1, step=0.01)
+                    with gr.Row():
+                        structure_loss_weight = gr.Slider(label="Structure loss weight", value=1000, minimum=0.0, maximum=10000, step=100)
+                        structure_loss_iter = gr.Slider(label="Structure loss iteration", value=10, minimum=0.0, maximum=1000, step=1)
                     with gr.Row():
                         generate1 = gr.Button(value="Run")
 
@@ -547,7 +574,9 @@ with gr.Blocks(css=css) as demo:
           num_inference_steps,
           width, height, seed, strength,          
           cross_replace_steps, self_replace_steps, 
-          thresh_e, thresh_m, denoise]
+          thresh_e, thresh_m, denoise,
+          structure_loss, structure_loss_steps,
+          structure_loss_weight, structure_loss_iter]
     inputs4 =[img, source_prompt, target_prompt,
           local, mutual,
           positive_prompt, negative_prompt,
@@ -555,7 +584,10 @@ with gr.Blocks(css=css) as demo:
           num_inference_steps,
           width, height, seed, strength,          
           cross_replace_steps, self_replace_steps, 
-          thresh_e, thresh_m, denoise, user_instruct, api_key]
+          thresh_e, thresh_m, denoise,
+          structure_loss, structure_loss_steps,
+          structure_loss_weight, structure_loss_iter,
+          user_instruct, api_key]
     generate1.click(inference, inputs=inputs1, outputs=image_out)
     generate3.click(inference, inputs=inputs1, outputs=image_out)
     generate4.click(inference, inputs=inputs4, outputs=image_out)
@@ -594,5 +626,11 @@ with gr.Blocks(css=css) as demo:
           cross_replace_steps, self_replace_steps, 
           thresh_e, thresh_m, denoise],
         image_out, inference, examples_per_page=20)
-demo.launch(debug=False, share=True)
+# breakpoint()
+demo.launch(debug=True, share=True)
+
+# example = ["images/corgi.jpg","corgi","cat","","","","",1,2,50,512,512,0,1,0.0,0.0,0.6,0.6,False]
+# example_image = Image.open(example[0])
+# example[0] = example_image
+# inference(*example)
 
