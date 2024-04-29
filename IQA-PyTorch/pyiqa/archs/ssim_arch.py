@@ -352,7 +352,7 @@ def ssim_structure(X,
         return ssim_map, weights
 
     if get_ssim_map:
-        return ssim_map
+        return ssim_val, ssim_map
 
     if get_cs:
         return ssim_val, cs_map.mean([1, 2, 3])
@@ -388,5 +388,8 @@ class SSIM_structure(torch.nn.Module):
         X = preprocess_rgb(X, self.test_y_channel, self.data_range, self.color_space)
         Y = preprocess_rgb(Y, self.test_y_channel, self.data_range, self.color_space) 
 
-        score = ssim_structure(X, Y, data_range=self.data_range, downsample=self.downsample, get_ssim_map=self.get_ssim_map)
-        return score
+        ssim = ssim_structure(X, Y, data_range=self.data_range, downsample=self.downsample, get_ssim_map=self.get_ssim_map)
+        if self.get_ssim_map:
+            return ssim[0], ssim[1]     # ssim value, ssim map
+        else:
+            return ssim                 # ssim value

@@ -21,8 +21,8 @@ colab_instruction = "" if is_colab else """
 Colab Instuction"""
 
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-model_id_or_path = "SimianLuo/LCM_Dreamshaper_v7"
-# model_id_or_path = "stabilityai/stable-diffusion-2-1"
+# model_id_or_path = "SimianLuo/LCM_Dreamshaper_v7"
+model_id_or_path = "stabilityai/stable-diffusion-2-1-base"
 device_print = "GPU 🔥" if torch.cuda.is_available() else "CPU 🥶"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -232,6 +232,10 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
                 q=torch.cat([q[:num_heads],q[:num_heads],q[:num_heads]])    # [source, source, source]
                 k=torch.cat([k[:num_heads],k[:num_heads],k[:num_heads]])    # [source, source, source]
                 v=torch.cat([v[:num_heads*2],v[:num_heads]])                # [source, target, source]
+
+                # q=torch.cat([q[:num_heads],q[:num_heads],q[:num_heads]])    # [source, source, source]
+                # k=torch.cat([k[:num_heads*2],k[:num_heads]])    # [source, target, source]
+                # v=torch.cat([v[:num_heads*2],v[:num_heads]])    # [source, target, source]
             return q,k,v
         else:
             qu, qc = q.chunk(2)
@@ -252,6 +256,13 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
                 vu=torch.cat([vu[:num_heads*2],vu[:num_heads]])
                 vc=torch.cat([vc[:num_heads*2],vc[:num_heads]])
 
+                # qu=torch.cat([qu[:num_heads],qu[:num_heads],qu[:num_heads]])
+                # qc=torch.cat([qc[:num_heads],qc[:num_heads],qc[:num_heads]])
+                # ku=torch.cat([ku[:num_heads*2],ku[:num_heads]])
+                # kc=torch.cat([kc[:num_heads*2],kc[:num_heads]])
+                # vu=torch.cat([vu[:num_heads*2],vu[:num_heads]])
+                # vc=torch.cat([vc[:num_heads*2],vc[:num_heads]])
+
             return torch.cat([qu, qc], dim=0) ,torch.cat([ku, kc], dim=0), torch.cat([vu, vc], dim=0)
 
     def forward(self, attn, is_cross: bool, place_in_unet: str):
@@ -264,7 +275,8 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
             # if not torch.all(torch.eq(attn_base, attn_base_store)):
             #     print('attn_base != attn_base_store')
             if (self.cross_replace_steps >= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
-                attn[1] = attn_base_store
+                # attn[1] = attn_base_store
+                attn[1] = attn_replace_new
             attn_store=torch.cat([attn_base_store,attn_replace_new])
             attn = attn.reshape(self.batch_size * h, *attn.shape[2:])
             attn_store = attn_store.reshape(2 *h, *attn_store.shape[2:])
@@ -551,7 +563,7 @@ with gr.Blocks(css=css) as demo:
             with gr.Tab("Advanced options"):
                 with gr.Group():
                     with gr.Row():
-                        num_inference_steps = gr.Slider(label="Inference steps", value=15, minimum=1, maximum=50, step=1)
+                        num_inference_steps = gr.Slider(label="Inference steps", value=15, minimum=1, maximum=500, step=1)
                         width = gr.Slider(label="Width", value=512, minimum=512, maximum=1024, step=8)
                         height = gr.Slider(label="Height", value=512, minimum=512, maximum=1024, step=8)
                     with gr.Row():

@@ -41,7 +41,13 @@ class MS_SSIM:
 
 class SSIM_structure:
     def __init__(self, **kwargs):
+        if 'get_ssim_map' in kwargs:
+            self.get_ssim_map = kwargs['get_ssim_map']
         self.l = pyiqa.create_metric('ssim_structure', device='cuda', as_loss=True, **kwargs)
     
     def __call__(self, source, target):
+        if hasattr(self, 'get_ssim_map') and self.get_ssim_map is True:
+            ssim_val, ssim_map = self.l((source + 1.) / 2., (target + 1.) / 2.)
+            self.ssim_map = ssim_map
+            return 1. - ssim_val
         return 1. - self.l((source + 1.) / 2., (target + 1.) / 2.)
