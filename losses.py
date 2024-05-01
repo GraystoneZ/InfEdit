@@ -15,7 +15,7 @@ def init_structure_loss(loss_name : str, **kwargs):
     elif loss_name == 'SSIM_structure':
         return SSIM_structure(**kwargs)
     else:
-        print('Not defined structure loss')
+        print('Undefined structure loss')
         return None
 
 class LPIPS:
