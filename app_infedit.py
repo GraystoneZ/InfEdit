@@ -21,8 +21,8 @@ colab_instruction = "" if is_colab else """
 Colab Instuction"""
 
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-# model_id_or_path = "SimianLuo/LCM_Dreamshaper_v7"
-model_id_or_path = "stabilityai/stable-diffusion-2-1-base"
+model_id_or_path = "SimianLuo/LCM_Dreamshaper_v7"
+# model_id_or_path = "stabilityai/stable-diffusion-2-1-base"
 device_print = "GPU 🔥" if torch.cuda.is_available() else "CPU 🥶"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -403,6 +403,9 @@ def inference(img, source_prompt, target_prompt,
                    )
 
     # return replace_nsfw_images(results)
+    filename = f'experiments/20240502/temp/inf({num_inference_steps})_att({cross_replace_steps},{self_replace_steps})' \
+               f'_l({structure_loss},{structure_loss_steps},{structure_loss_iter},{structure_loss_weight}).png'
+    results[0].save(filename)
     return results[0]
 
 
@@ -552,7 +555,7 @@ with gr.Blocks(css=css) as demo:
                         strength = gr.Slider(label="Strength", value=0.7, minimum=0, maximum=1, step=0.01, visible=False)
                         denoise.change(fn=lambda value: gr.update(visible=value), inputs=denoise, outputs=strength)
                     with gr.Row():
-                        structure_loss = gr.Dropdown(["L1", "LPIPS", "SSIM", "SSIM_structure", None], value=None, label="Structure loss")
+                        structure_loss = gr.Dropdown(["L1", "LPIPS", "SSIM", "SSIM_structure", "Sobel", "Sobel_SSIM_structure", None], value=None, label="Structure loss")
                         structure_loss_steps = gr.Slider(label="Structure loss schedule", value=0.5, minimum=0.0, maximum=1, step=0.01)
                     with gr.Row():
                         structure_loss_weight = gr.Slider(label="Structure loss weight", value=1000, minimum=0.0, maximum=10000, step=100)
