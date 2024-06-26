@@ -6,16 +6,17 @@ import torch.nn.functional as F
 from .boxfilter import boxfilter2d
 
 class GuidedFilter2d(nn.Module):
-    def __init__(self, radius: int, eps: float):
+    def __init__(self, radius: int, eps: torch.float16, color_seperate: bool):
         super().__init__()
         self.r = radius
         self.eps = eps
+        self.color_seperate = color_seperate
 
     def forward(self, x, guide):
-        if guide.shape[1] == 3:
-            return guidedfilter2d_color(guide, x, self.r, self.eps)
-        elif guide.shape[1] == 1:
+        if guide.shape[1] == 1 or self.color_seperate:
             return guidedfilter2d_gray(guide, x, self.r, self.eps)
+        elif guide.shape[1] == 3:
+            return guidedfilter2d_color(guide, x, self.r, self.eps)
         else:
             raise NotImplementedError
 
@@ -167,4 +168,5 @@ def guidedfilter2d_gray(guide, src, radius, eps, scale=None):
         mean_b = F.interpolate(mean_b, guide.shape[-2:], mode='bilinear')
 
     q = mean_a * guide + mean_b
+    # q = a * guide + b
     return q

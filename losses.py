@@ -1,6 +1,7 @@
 import pyiqa
 import torch.nn
 import kornia
+from guided_filter_pytorch.guided_filter import GuidedFilter2d
 
 def init_structure_loss(loss_name : str, **kwargs):
     if loss_name == 'L1':
@@ -19,6 +20,8 @@ def init_structure_loss(loss_name : str, **kwargs):
         return Sobel()
     elif loss_name == 'Sobel_SSIM_structure':
         return Sobel_SSIM_structure(**kwargs)
+    elif loss_name == 'Guided_filter':
+        return Guided_filter()
     else:
         print('Undefined structure loss')
         return None
@@ -83,3 +86,16 @@ class Sobel_SSIM_structure:
             self.ssim_map = ssim_map
             return 1. - ssim_val
         return 1. - self.l(source_edge, target_edge)
+
+class Guided_filter:
+    def __init__(self, radius=5, eps=1e-4):
+        self.GF = GuidedFilter2d(radius, eps, True)
+        self.l = torch.nn.MSELoss()
+    
+    def __call__(self, source, target):
+        source = source.to(dtype=torch.float32)
+        target = target.to(dtype=torch.float32)
+        filtered = self.GF((source + 1.) / 2., (target + 1.) / 2.)
+        print(f'filtered min max = {filtered.min(), filtered.max()}')
+        loss = self.l((source + 1.) / 2., filtered)
+        return loss

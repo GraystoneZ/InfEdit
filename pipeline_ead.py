@@ -7,6 +7,7 @@ import torch
 from packaging import version
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
+from diffusers import ConsistencyDecoderVAE
 from diffusers.configuration_utils import FrozenDict
 from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.loaders import LoraLoaderMixin, TextualInversionLoaderMixin
@@ -83,20 +84,37 @@ def ddcm_sampler(scheduler, x_s, x_t, timestep, e_s, e_t, x_0, noise, eta, to_ne
     eps = (e_t - e_s) + e_c
     dir_xt = (beta_prod_t_prev - std_dev_t) ** (0.5) * eps      # Goes 0 because of alpha and sigma setting
 
+    backprop_space = 'image'
     # Structure loss part
     if structure_loss_fn != None and structure_loss_steps <= (scheduler.step_index*1.0 / len(scheduler.timesteps)):
-        pred_x0_gd = pred_x0.clone()
-        pred_x0_gd.requires_grad = True
-        optimizer = SGD(params=[pred_x0_gd], lr=1e-1, momentum=0.9)
-        # optimizer = Adam(params=[pred_x0_gd], lr=1e-3, eps=1e-8, fused=True)
+        if backprop_space == 'latent':
+            pred_x0_gd = pred_x0.clone()
+            pred_x0_gd.requires_grad = True
+            optimizer = SGD(params=[pred_x0_gd], lr=1, momentum=0.9)
+            # optimizer = Adam(params=[pred_x0_gd], eps=1e-4)
 
-        for _ in range(structure_loss_iter):
-            optimizer.zero_grad()
-            pred_x0_gd_decode = vae.decode(pred_x0_gd / vae.config.scaling_factor, return_dict=False)[0].clamp(-1.0, 1.0)
-            loss = structure_loss_weight * structure_loss_fn(source_image, pred_x0_gd_decode)
-            loss.backward()
-            optimizer.step()
-        pred_x0 = pred_x0_gd.clone().detach()
+            for _ in range(structure_loss_iter):
+                optimizer.zero_grad()
+                pred_x0_gd_decode = vae.decode(pred_x0_gd / vae.config.scaling_factor, return_dict=False)[0].clamp(-1.0, 1.0)
+                loss = structure_loss_weight * structure_loss_fn(source_image, pred_x0_gd_decode)
+                print(f'loss = {loss}')
+                loss.backward()
+                optimizer.step()
+            pred_x0 = pred_x0_gd.clone().detach()
+        elif backprop_space == 'image':
+            pred_x0_decode = vae.decode(pred_x0 / vae.config.scaling_factor, return_dict=False)[0].clamp(-1.0, 1.0)
+            pred_x0_decode = pred_x0_decode.detach()
+            pred_x0_decode.requires_grad = True
+            optimizer = SGD(params=[pred_x0_decode], lr=1, momentum=0.9)
+            for _ in range(structure_loss_iter):
+                optimizer.zero_grad()
+                loss = structure_loss_weight * structure_loss_fn(source_image, pred_x0_decode)
+                print(f'loss = {loss}')
+                loss.backward()
+                optimizer.step()
+            pred_x0 = vae.config.scaling_factor * vae.encode(pred_x0_decode).latent_dist.sample()
+            pred_x0 = pred_x0.detach()
+            pred_x0.requires_grad = False
 
     # Noise is not used for one-step sampling.
     if len(scheduler.timesteps) > 1:
@@ -117,7 +135,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
     def __init__(
         self,
-        vae: AutoencoderKL,
+        vae: Union[AutoencoderKL, ConsistencyDecoderVAE],
         text_encoder: CLIPTextModel,
         tokenizer: CLIPTokenizer,
         unet: UNet2DConditionModel,
@@ -597,6 +615,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             if structure_loss is not None:
                 # Store image that passed vae once for structure loss
                 image_vae = self.vae.decode(clean_latents / self.vae.config.scaling_factor, return_dict=False)[0].clamp(-1.0, 1.0)
+                # image_vae = image.clone().to(device=device, dtype=image_vae.dtype)
 
             # Initialize structure loss
             structure_loss_fn = init_structure_loss(structure_loss)
